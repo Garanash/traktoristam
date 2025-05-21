@@ -1,13 +1,13 @@
 # Конфигурационные данные
-API_ID = 23715784                # Замените на ваш API ID
-API_HASH = "fb3627e3100eec5a09121035d462338a"       # Замените на ваш API HASH
-PHONE_NUMBER = "+79152048909"
+API_ID = "your_id"                # Замените на ваш API ID
+API_HASH = "your_hash"       # Замените на ваш API HASH
+PHONE_NUMBER = "your_phone_number"
 
 
-BOT_TOKEN = "7992422589:AAEKoEtmgWFjQVnDmaMIYdFLrINKK8IFmmM"     # Токен бота от @BotFather
+BOT_TOKEN = "your_bot_token"     # Токен бота от @BotFather
 
 
-CHANNEL_ID = '@agb_test_chanel'   # ID канала (например, -1001234567890)
-USER_ID = "@Garanash" # 476409056    #"@Garanash"            # ID пользователя, которому отправлять посты
+CHANNEL_ID = '@your_chanel_for_parsing'   # ID канала (например, -1001234567890)
+USER_ID = "@user_id_for_send_message" # 476409056    #"@Garanash"            # ID пользователя, которому отправлять посты
 
-OUTPUT_CHANNEL_ID = "@searcher_for_tractors_bot"  # Добавьте этот параметр
+OUTPUT_CHANNEL_ID = "@your_second_chanel_for_searching"  # Добавьте этот параметр
