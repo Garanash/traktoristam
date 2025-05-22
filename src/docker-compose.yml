@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  telegram-bot:
+    build: .
+    container_name: telegram-bot
+    restart: unless-stopped
+    volumes:
+      - ./files:/app/files  # монтируем директорию с файлами
+      - ./config.py:/app/config.py  # монтируем конфиг
+      - ./new_user_session.session:/app/new_user_session.session  # сессионные файлы
+      - ./sync_user_session.session:/app/sync_user_session.session
+    environment:
+      - TZ=Europe/Moscow  # установите свою временную зону
+    # Если ваш бот использует переменные окружения, добавьте их здесь
+    # command: python main.py  # если нужно указать конкретную команду для запуска
