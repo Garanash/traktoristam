@@ -18,7 +18,7 @@ class ChannelMonitor:
         self.message_queue = deque()
         self.current_message_processing = None
         self.article_timeouts = {}
-        self.pending_responses = set()
+        self.pending_responses = {}
         self.api_request_lock = asyncio.Lock()
         self.processing_lock = asyncio.Lock()
         self.processing_active = False
@@ -29,13 +29,11 @@ class ChannelMonitor:
         await self.client.start(config.PHONE_NUMBER)
 
         try:
-            # Получаем сущности каналов
             self.output_channel = await self.client.get_entity(config.OUTPUT_CHANNEL_ID)
             self.private_channel = await self.client.get_entity(config.PRIVATE_CHANNEL_ID)
 
             print("✅ Бот инициализирован")
 
-            # Безопасное получение названий (для каналов и пользователей)
             output_name = getattr(self.output_channel, 'title',
                                   getattr(self.output_channel, 'username',
                                           getattr(self.output_channel, 'first_name', 'N/A')))
@@ -65,7 +63,7 @@ class ChannelMonitor:
 4. Только факты, без комментариев!"""
 
         payload = {
-            "model": "sonar-medium-online",
+            "model": "sonar-pro",
             "messages": [
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"Извлеки артикулы:\n{message_text}"}
@@ -87,7 +85,6 @@ class ChannelMonitor:
                         data = await response.json()
                         content = data['choices'][0]['message']['content']
 
-                        # Валидация и очистка ответа
                         result = []
                         for line in content.split('\n'):
                             line = line.strip()
@@ -106,46 +103,49 @@ class ChannelMonitor:
     async def process_message_queue(self):
         """Обработка очереди сообщений"""
         while True:
-            if self.message_queue and not self.processing_active:
-                async with self.processing_lock:
-                    if self.message_queue and not self.processing_active:
-                        self.processing_active = True
-                        message_data = self.message_queue.popleft()
+            try:
+                if self.message_queue and not self.processing_active:
+                    async with self.processing_lock:
+                        if self.message_queue and not self.processing_active:
+                            self.processing_active = True
+                            message_data = self.message_queue.popleft()
 
-                        print(f"\n🚀 Начата обработка сообщения ID: {message_data['message'].id}")
+                            print(f"\n🚀 Начата обработка сообщения ID: {message_data['message'].id}")
 
-                        # Подготовка данных для обработки
-                        processing_data = {
-                            'message': message_data['message'],
-                            'user': message_data['user'],
-                            'articles_data': [],
-                            'responses': [],
-                            'timestamp': datetime.now()
-                        }
+                            processing_data = {
+                                'message': message_data['message'],
+                                'user': message_data['user'],
+                                'articles_data': [],
+                                'responses': [],
+                                'timestamp': datetime.now(),
+                                'pending_articles': set()
+                            }
 
-                        # Запрос к Perplexity API
-                        api_response = await self.extract_articles_with_perplexity(
-                            message_data['message'].message
-                        )
+                            api_response = await self.extract_articles_with_perplexity(
+                                message_data['message'].message
+                            )
 
-                        if api_response:
-                            await self.process_api_response(processing_data, api_response)
+                            if api_response:
+                                await self.process_api_response(processing_data, api_response)
 
-                            # Отправка артикулов во второй канал для получения цен
-                            for article in processing_data['articles_data']:
-                                await self.client.send_message(
-                                    self.output_channel,
-                                    article['article']
-                                )
-                                self.article_timeouts[article['article']] = datetime.now()
-                                self.pending_responses.add(article['article'])
+                                for article in processing_data['articles_data']:
+                                    await self.client.send_message(
+                                        self.output_channel,
+                                        article['article']
+                                    )
+                                    self.article_timeouts[article['article']] = datetime.now()
+                                    processing_data['pending_articles'].add(article['article'])
+                                    self.pending_responses[article['article']] = processing_data
 
-                            self.current_message_processing = processing_data
-                        else:
-                            print("❌ Не удалось обработать сообщение")
-                            self.processing_active = False
-
-            await asyncio.sleep(1)
+                                self.current_message_processing = processing_data
+                            else:
+                                print("❌ Не удалось обработать сообщение")
+                                self.processing_active = False
+                await asyncio.sleep(1)
+            except Exception as e:
+                print(f"⚠️ Ошибка в process_message_queue: {e}")
+                self.processing_active = False
+                await asyncio.sleep(5)
 
     async def process_api_response(self, processing_data, api_response):
         """Обработка ответа от API"""
@@ -159,7 +159,8 @@ class ChannelMonitor:
                     'article': article,
                     'quantity': float(quantity),
                     'processed': False,
-                    'found': None
+                    'found': None,
+                    'response_data': None
                 })
                 print(f"🔍 Найден артикул: {article} ({quantity} шт.)")
             except Exception as e:
@@ -167,31 +168,48 @@ class ChannelMonitor:
 
     async def handle_output_channel_response(self, response_message):
         """Обработка ответа от второго бота с ценами"""
-        if not self.processing_active or not self.current_message_processing:
-            return
+        try:
+            if not response_message.out and response_message.sender_id == self.output_channel.id:
+                bot_data = self.parse_second_bot_response(response_message.message)
+                if not bot_data:
+                    return
 
-        bot_data = self.parse_second_bot_response(response_message.message)
+                found_articles = set()
+                for article in list(self.pending_responses.keys()):
+                    if article in response_message.message:
+                        processing_data = self.pending_responses.get(article)
+                        if not processing_data:
+                            continue
 
-        for article_data in self.current_message_processing['articles_data']:
-            if (article_data['article'] in response_message.message
-                    and not article_data['processed']):
+                        for article_data in processing_data['articles_data']:
+                            if article_data['article'] == article and not article_data['processed']:
+                                article_data.update({
+                                    'processed': True,
+                                    'found': bot_data['found'],
+                                    'response_data': bot_data
+                                })
 
-                article_data.update({
-                    'processed': True,
-                    'found': bot_data['found'],
-                    'response_received': True
-                })
+                                if bot_data['found']:
+                                    processing_data['responses'].append({
+                                        'article_data': article_data,
+                                        'bot_data': bot_data
+                                    })
+                                    print(f"💰 Получена цена для {article}")
 
-                if bot_data['found']:
-                    self.current_message_processing['responses'].append({
-                        'article_data': article_data,
-                        'bot_data': bot_data
-                    })
-                    print(f"💰 Получена цена для {article_data['article']}")
+                                found_articles.add(article)
+                                processing_data['pending_articles'].discard(article)
 
-                self.pending_responses.discard(article_data['article'])
-                await self.check_complete_response()
-                break
+                for article in found_articles:
+                    if article in self.pending_responses:
+                        del self.pending_responses[article]
+                    if article in self.article_timeouts:
+                        del self.article_timeouts[article]
+
+                    processing_data = self.pending_responses.get(article)
+                    if processing_data and not processing_data['pending_articles']:
+                        await self.finalize_processing(processing_data)
+        except Exception as e:
+            print(f"⚠️ Ошибка в handle_output_channel_response: {e}")
 
     def parse_second_bot_response(self, response_text):
         """Парсинг ответа от второго бота"""
@@ -216,62 +234,75 @@ class ChannelMonitor:
 
         return result
 
-    async def check_complete_response(self):
-        """Проверка завершения обработки всех артикулов"""
-        if not self.processing_active:
-            return
+    async def check_timeouts(self):
+        """Проверка таймаутов обработки артикулов"""
+        while True:
+            try:
+                now = datetime.now()
+                timeout = timedelta(seconds=30)
 
-        timeout = timedelta(seconds=60)
-        now = datetime.now()
+                for article, timestamp in list(self.article_timeouts.items()):
+                    if (now - timestamp) > timeout:
+                        processing_data = self.pending_responses.get(article)
+                        if processing_data:
+                            for article_data in processing_data['articles_data']:
+                                if article_data['article'] == article and not article_data['processed']:
+                                    article_data.update({
+                                        'processed': True,
+                                        'found': False,
+                                        'response_data': None
+                                    })
+                                    print(f"⏰ Таймаут для артикула {article}")
 
-        all_processed = all(
-            article['processed'] or
-            (article['article'] in self.article_timeouts and
-             (now - self.article_timeouts[article['article']]) > timeout)
-            for article in self.current_message_processing['articles_data']
-        )
+                            processing_data['pending_articles'].discard(article)
+                            if article in self.pending_responses:
+                                del self.pending_responses[article]
+                            if article in self.article_timeouts:
+                                del self.article_timeouts[article]
 
-        if all_processed:
-            await self.finalize_processing()
+                            if not processing_data['pending_articles']:
+                                await self.finalize_processing(processing_data)
+                await asyncio.sleep(5)
+            except Exception as e:
+                print(f"⚠️ Ошибка в check_timeouts: {e}")
+                await asyncio.sleep(10)
 
-    async def finalize_processing(self):
+    async def finalize_processing(self, processing_data):
         """Финальная обработка и отправка результата"""
-        if not self.processing_active:
-            return
-
         try:
+            if not processing_data:
+                return
+
             priced_items = [
-                r for r in self.current_message_processing['responses']
+                r for r in processing_data['responses']
                 if r['article_data']['found']
             ]
 
             if priced_items:
-                await self.send_to_private_channel()
+                await self.send_to_private_channel(processing_data)
             else:
                 print("ℹ️ Нет расцененных артикулов")
 
-        finally:
+            if processing_data == self.current_message_processing:
+                self.cleanup_processing()
+        except Exception as e:
+            print(f"⚠️ Ошибка в finalize_processing: {e}")
             self.cleanup_processing()
 
-    async def send_to_private_channel(self):
+    async def send_to_private_channel(self, processing_data):
         """Формирование и отправка результата в приватный канал"""
         try:
-            message_data = self.current_message_processing
-            original_message = message_data['message']
-
-            # Получаем информацию о канале отправителя
+            original_message = processing_data['message']
             channel_entity = await self.client.get_entity(original_message.peer_id)
             post_link = f"https://t.me/c/{channel_entity.id}/{original_message.id}"
 
-            # Создаем заголовок сообщения
-            response_text = f"📎 [Исходное сообщение]({post_link})\n\n"
-            response_text += "📊 Результат обработки артикулов:\n\n"
+            response_text = f"📎 [Исходное сообщение]({post_link})\n"
+            response_text += "📊 Результат обработки артикулов:\n"
 
-            # Рассчитываем суммы
             total_sum = 0
             total_discount_sum = 0
 
-            for item in message_data['responses']:
+            for item in processing_data['responses']:
                 if item['article_data']['found']:
                     bot_data = item['bot_data']
                     article_data = item['article_data']
@@ -282,33 +313,27 @@ class ChannelMonitor:
                     total_sum += item_total
                     total_discount_sum += item_discount
 
-                    stock_info = f" ({bot_data['stock_quantity']} шт.)" if bot_data['stock_quantity'] else ""
+                    stock_info = f" ({bot_data['stock_quantity']} шт на складе)" if bot_data['stock_quantity'] else ""
 
                     response_text += (
-                        f"🔹 Артикул: {article_data['article']}\n"
+                        f"\n🔹 Артикул: {article_data['article']}\n"
                         f"🏷️ Наименование: {bot_data['name'] or 'Без названия'}\n"
-                        f"📦 Количество: {article_data['quantity']}{stock_info}\n"
-                        f"💰 Цена: {bot_data['price']:.2f} ₽/шт\n"
-                        f"🧮 Сумма: {item_total:.2f} ₽\n"
-                        f"🎁 Со скидкой 3%: {item_discount:.2f} ₽\n\n"
+                        f"📦 Запрошенное количество: {int(article_data['quantity'])} {stock_info}\n"
+                        f"💰 Цена за штуку: {bot_data['price']:.2f} ₽/шт\n"
                     )
 
-            # Добавляем итоговую информацию
             if total_sum > 0:
                 response_text += (
-                    f"💵 Общая сумма: {total_sum:.2f} ₽\n"
-                    f"💳 Со скидкой: {total_discount_sum:.2f} ₽\n"
+                    f"\n💵 Общая сумма: {total_sum:.2f} ₽\n"
                 )
 
-            # Отправляем сообщение в приватный канал
             await self.client.send_message(
                 entity=self.private_channel,
                 message=response_text,
                 link_preview=False
             )
 
-            print(f"✉️ Результат отправлен в приватный канал {self.private_channel.title}")
-
+            print(f"✉️ Результат отправлен в приватный канал")
         except Exception as e:
             print(f"⚠️ Ошибка при отправке в приватный канал: {e}")
 
@@ -322,27 +347,16 @@ class ChannelMonitor:
     async def monitor_output_channel(self):
         """Мониторинг ответов от второго бота"""
         print("👂 Начало мониторинга выходного канала...")
-        last_id = 0
+
+        @self.client.on(events.NewMessage(chats=self.output_channel))
+        async def handler(event):
+            try:
+                await self.handle_output_channel_response(event.message)
+            except Exception as e:
+                print(f"⚠️ Ошибка обработки сообщения: {e}")
 
         while True:
-            try:
-                history = await self.client(GetHistoryRequest(
-                    peer=self.output_channel,
-                    limit=5,
-                    offset_id=0,
-                    min_id=last_id
-                ))
-
-                if history.messages:
-                    for msg in history.messages:
-                        if msg.id > last_id and not msg.out:
-                            await self.handle_output_channel_response(msg)
-                            last_id = msg.id
-
-                await asyncio.sleep(5)
-            except Exception as e:
-                print(f"⚠️ Ошибка мониторинга канала: {e}")
-                await asyncio.sleep(10)
+            await asyncio.sleep(10)
 
     async def process_messages(self, user, messages):
         """Обработка новых сообщений из канала"""
@@ -366,45 +380,35 @@ class ChannelMonitor:
 
         self.last_checked_id = max(msg.id for msg in messages_to_process)
 
-    async def check_timeouts(self):
-        """Проверка таймаутов обработки артикулов"""
-        while True:
-            try:
-                if self.processing_active and self.current_message_processing:
-                    await self.check_complete_response()
-                await asyncio.sleep(5)
-            except Exception as e:
-                print(f"⚠️ Ошибка проверки таймаутов: {e}")
-                await asyncio.sleep(10)
-
 
 async def main():
     monitor = ChannelMonitor()
     await monitor.initialize()
 
     try:
-        # Получаем входной канал и пользователя
         input_channel = await monitor.client.get_entity(config.CHANNEL_ID)
         user = await monitor.client.get_entity(config.USER_ID)
 
         print(f"\n🔍 Мониторинг канала: {input_channel.title}")
         print(f"👤 Пользователь: {user.first_name if user.first_name else user.username}\n")
 
-        # Запускаем фоновые задачи
         tasks = [
             asyncio.create_task(monitor.monitor_output_channel()),
             asyncio.create_task(monitor.check_timeouts()),
             asyncio.create_task(monitor.process_message_queue())
         ]
 
-        # Основной цикл обработки сообщений
         while True:
             try:
                 history = await monitor.client(GetHistoryRequest(
                     peer=input_channel,
                     limit=100,
+                    offset_date=None,
                     offset_id=0,
-                    min_id=monitor.last_checked_id
+                    max_id=0,
+                    min_id=monitor.last_checked_id,
+                    add_offset=0,
+                    hash=0
                 ))
 
                 if history.messages:
