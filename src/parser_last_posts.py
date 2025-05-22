@@ -1,11 +1,11 @@
 import asyncio
 import aiohttp
-from telethon import TelegramClient
-from telethon.tl.functions.messages import GetHistoryRequest
-import config
 import re
 from datetime import datetime, timedelta
 from collections import deque
+from telethon import TelegramClient, events
+from telethon.tl.functions.messages import GetHistoryRequest
+import config
 
 
 class ChannelMonitor:
@@ -14,198 +14,187 @@ class ChannelMonitor:
         self.processed_ids = set()
         self.client = None
         self.output_channel = None
+        self.private_channel = None
         self.message_queue = deque()
         self.current_message_processing = None
         self.article_timeouts = {}
         self.pending_responses = set()
         self.api_request_lock = asyncio.Lock()
         self.processing_lock = asyncio.Lock()
-        self.processing_active = False  # Флаг активности обработки
+        self.processing_active = False
 
     async def initialize(self):
-        self.client = TelegramClient('new_user_session', config.API_ID, config.API_HASH)
+        """Инициализация клиента Telegram и каналов"""
+        self.client = TelegramClient('session_name', config.API_ID, config.API_HASH)
         await self.client.start(config.PHONE_NUMBER)
 
-        if isinstance(config.OUTPUT_CHANNEL_ID, str):
+        try:
+            # Получаем сущности каналов
             self.output_channel = await self.client.get_entity(config.OUTPUT_CHANNEL_ID)
-        else:
-            self.output_channel = await self.client.get_entity(int(config.OUTPUT_CHANNEL_ID))
+            self.private_channel = await self.client.get_entity(config.PRIVATE_CHANNEL_ID)
 
-        print("✅ Клиент успешно инициализирован")
+            print("✅ Бот инициализирован")
 
-    async def send_to_protalk_api(self, message_text, max_retries=3):
-        url = "https://api.pro-talk.ru/api/v1.0/ask/k7LZ7GN49P1UtvN1DJX4qYesMXml82Ij"
-        headers = {
-            'Content-Type': 'application/json',
-            'User-Agent': 'Mozilla/5.0'
-        }
+            # Безопасное получение названий (для каналов и пользователей)
+            output_name = getattr(self.output_channel, 'title',
+                                  getattr(self.output_channel, 'username',
+                                          getattr(self.output_channel, 'first_name', 'N/A')))
+            private_name = getattr(self.private_channel, 'title',
+                                   getattr(self.private_channel, 'username',
+                                           getattr(self.private_channel, 'first_name', 'N/A')))
 
-        # Убедимся, что message_text не содержит None
-        clean_message = str(message_text) if message_text else ""
+            print(f"📢 Выходной канал: {output_name}")
+            print(f"🔒 Приватный канал: {private_name}")
 
-        payload = {
-            "bot_id": 25815,
-            "chat_id": "channel_monitor",
-            "message": clean_message[:4096]  # Ограничим размер сообщения
-        }
+        except Exception as e:
+            print(f"⚠️ Ошибка инициализации каналов: {e}")
+            raise
 
-        print(f"🔄 Отправка в API: {clean_message[:50]}...")
-
-        # Конфигурация таймаутов (в секундах)
-        connector = aiohttp.TCPConnector(
-            force_close=True,
-            enable_cleanup_closed=True,
-            limit=30
-        )
-
-        timeout = aiohttp.ClientTimeout(
-            total=30,  # Общий таймаут
-            connect=15,  # Таймаут на подключение
-            sock_connect=15,  # Таймаут на установку соединения
-            sock_read=15  # Таймаут на чтение
-        )
-
-        for attempt in range(1, max_retries + 1):
-            try:
-                async with aiohttp.ClientSession(
-                        connector=connector,
-                        timeout=timeout,
-                        trust_env=True
-                ) as session:
-                    try:
-                        async with session.post(
-                                url,
-                                json=payload,
-                                headers=headers,
-                                ssl=False  # Попробуйте True если False не работает
-                        ) as response:
-
-                            # Проверяем статус ответа
-                            if response.status != 200:
-                                error_text = await response.text()
-                                print(f"⚠️ API Error {response.status}: {error_text}")
-                                continue
-
-                            try:
-                                data = await response.json()
-                                if 'done' not in data:
-                                    print(f"⚠️ Invalid API response: {data}")
-                                    continue
-
-                                return data
-
-                            except ValueError as e:
-                                print(f"⚠️ JSON decode error: {e}")
-                                continue
-
-                    except asyncio.TimeoutError:
-                        print(f"⌛ Timeout occurred (attempt {attempt}/{max_retries})")
-
-                    except aiohttp.ClientError as e:
-                        print(f"⚠️ Connection error (attempt {attempt}/{max_retries}): {str(e)}")
-
-            except Exception as e:
-                print(f"⚠️ Unexpected error (attempt {attempt}/{max_retries}): {str(e)}")
-
-            # Экспоненциальная задержка между попытками
-            if attempt < max_retries:
-                wait_time = min(2 ** attempt, 10)  # Максимум 10 секунд
-                print(f"⏳ Waiting {wait_time}s before retry...")
-                await asyncio.sleep(wait_time)
-
-        print(f"❌ Failed after {max_retries} attempts")
-        return None
-
-    async def extract_articles_with_perplexity(self, message_text, max_retries=3):
-        """
-        Анализирует текст сообщения и извлекает артикулы с количествами
-        Возвращает список строк в формате "артикул: количество" или None при ошибке
-        """
+    async def extract_articles_with_perplexity(self, message_text):
+        """Запрос к Perplexity API для извлечения артикулов"""
         url = "https://api.perplexity.ai/chat/completions"
         headers = {
             "Authorization": f"Bearer {config.PERPLEXITY_API_KEY}",
             "Content-Type": "application/json"
         }
 
-        system_prompt = """Ты помощник для извлечения артикулов товаров. Твоя задача:
-    1. Найти в тексте все артикулы товаров (комбинации букв и цифр)
-    2. Определить их количество (если указано)
-    3. Вывести строго в формате: "артикул: количество"
-    4. Если количество не указано - использовать 1
-    5. Никаких дополнительных комментариев и текста!
-
-    Пример вывода:
-    11Y-60-28712: 1
-    708-2Н-32210: 2
-    04697239: 1"""
+        system_prompt = """Ты помогаешь извлекать артикулы товаров. Правила:
+1. Найди все артикулы (комбинации букв, цифр и дефисов)
+2. Определи количество для каждого (по умолчанию 1)
+3. Выведи строго в формате: артикул: количество
+4. Только факты, без комментариев!"""
 
         payload = {
-            "model": "sonar-pro",
+            "model": "sonar-medium-online",
             "messages": [
-                {
-                    "role": "system",
-                    "content": system_prompt
-                },
-                {
-                    "role": "user",
-                    "content": f"Извлеки артикулы из текста:\n{message_text}"
-                }
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Извлеки артикулы:\n{message_text}"}
             ],
-            "temperature": 0.1,  # Минимум креативности
+            "temperature": 0.1,
             "max_tokens": 1000
         }
 
-        print(f"🔍 Анализ текста через Perplexity: {message_text[:50]}...")
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                        url,
+                        json=payload,
+                        headers=headers,
+                        timeout=aiohttp.ClientTimeout(total=30)
+                ) as response:
 
-        async with aiohttp.ClientSession() as session:
-            for attempt in range(1, max_retries + 1):
-                try:
-                    async with session.post(
-                            url,
-                            json=payload,
-                            headers=headers,
-                            timeout=aiohttp.ClientTimeout(total=30)
-                    ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        content = data['choices'][0]['message']['content']
 
-                        if response.status == 200:
-                            data = await response.json()
-                            response_text = data['choices'][0]['message']['content']
+                        # Валидация и очистка ответа
+                        result = []
+                        for line in content.split('\n'):
+                            line = line.strip()
+                            if re.match(r'^[\w\d-]+:\s*\d+$', line):
+                                result.append(line)
 
-                            # Очистка и валидация результата
-                            cleaned_lines = []
-                            for line in response_text.split('\n'):
-                                line = line.strip()
-                                if ':' in line:
-                                    # Удаляем все символы кроме разрешенных (буквы, цифры, дефисы, ":")
-                                    clean_line = re.sub(r'[^\w\d\-:]', '', line)
-                                    cleaned_lines.append(clean_line)
+                        return {'done': '\n'.join(result)} if result else None
 
-                            if cleaned_lines:
-                                return {'done': '\n'.join(cleaned_lines)}
-                            else:
-                                print("⚠️ Не найдены артикулы в ответе")
-                                return None
+                    print(f"⚠️ Ошибка API (статус {response.status}): {await response.text()}")
+                    return None
 
+        except Exception as e:
+            print(f"⚠️ Ошибка запроса к Perplexity: {str(e)}")
+            return None
+
+    async def process_message_queue(self):
+        """Обработка очереди сообщений"""
+        while True:
+            if self.message_queue and not self.processing_active:
+                async with self.processing_lock:
+                    if self.message_queue and not self.processing_active:
+                        self.processing_active = True
+                        message_data = self.message_queue.popleft()
+
+                        print(f"\n🚀 Начата обработка сообщения ID: {message_data['message'].id}")
+
+                        # Подготовка данных для обработки
+                        processing_data = {
+                            'message': message_data['message'],
+                            'user': message_data['user'],
+                            'articles_data': [],
+                            'responses': [],
+                            'timestamp': datetime.now()
+                        }
+
+                        # Запрос к Perplexity API
+                        api_response = await self.extract_articles_with_perplexity(
+                            message_data['message'].message
+                        )
+
+                        if api_response:
+                            await self.process_api_response(processing_data, api_response)
+
+                            # Отправка артикулов во второй канал для получения цен
+                            for article in processing_data['articles_data']:
+                                await self.client.send_message(
+                                    self.output_channel,
+                                    article['article']
+                                )
+                                self.article_timeouts[article['article']] = datetime.now()
+                                self.pending_responses.add(article['article'])
+
+                            self.current_message_processing = processing_data
                         else:
-                            error = await response.text()
-                            print(f"⚠️ Ошибка API (статус {response.status}): {error}")
+                            print("❌ Не удалось обработать сообщение")
+                            self.processing_active = False
 
-                except asyncio.TimeoutError:
-                    print(f"⌛ Таймаут соединения (попытка {attempt}/{max_retries})")
-                except Exception as e:
-                    print(f"⚠️ Ошибка (попытка {attempt}/{max_retries}): {str(e)}")
+            await asyncio.sleep(1)
 
-                if attempt < max_retries:
-                    await asyncio.sleep(2 ** attempt)
+    async def process_api_response(self, processing_data, api_response):
+        """Обработка ответа от API"""
+        if not api_response or 'done' not in api_response:
+            return
 
-        print(f"❌ Не удалось получить артикулы после {max_retries} попыток")
-        return None
+        for line in api_response['done'].split('\n'):
+            try:
+                article, quantity = map(str.strip, line.split(':'))
+                processing_data['articles_data'].append({
+                    'article': article,
+                    'quantity': float(quantity),
+                    'processed': False,
+                    'found': None
+                })
+                print(f"🔍 Найден артикул: {article} ({quantity} шт.)")
+            except Exception as e:
+                print(f"⚠️ Ошибка обработки строки: {line}")
 
+    async def handle_output_channel_response(self, response_message):
+        """Обработка ответа от второго бота с ценами"""
+        if not self.processing_active or not self.current_message_processing:
+            return
 
+        bot_data = self.parse_second_bot_response(response_message.message)
 
+        for article_data in self.current_message_processing['articles_data']:
+            if (article_data['article'] in response_message.message
+                    and not article_data['processed']):
 
+                article_data.update({
+                    'processed': True,
+                    'found': bot_data['found'],
+                    'response_received': True
+                })
+
+                if bot_data['found']:
+                    self.current_message_processing['responses'].append({
+                        'article_data': article_data,
+                        'bot_data': bot_data
+                    })
+                    print(f"💰 Получена цена для {article_data['article']}")
+
+                self.pending_responses.discard(article_data['article'])
+                await self.check_complete_response()
+                break
 
     def parse_second_bot_response(self, response_text):
+        """Парсинг ответа от второго бота"""
         result = {
             'name': None,
             'price': None,
@@ -214,242 +203,78 @@ class ChannelMonitor:
         }
 
         try:
-            if "Артикул не найден" in response_text:
-                return result
-
-            name_match = re.search(r'Наименование:\s*(.*)', response_text)
-            if name_match:
-                result['name'] = name_match.group(1).strip()
-
-            price_match = re.search(r'Цена за штуку:\s*([\d.,]+)', response_text)
-            if price_match:
-                result['price'] = float(price_match.group(1).replace(',', '.'))
-                result['found'] = True
-
-            stock_match = re.search(r'Количество на складе:\s*(\d+)', response_text)
-            if stock_match:
-                result['stock_quantity'] = int(stock_match.group(1))
-
+            if "Артикул не найден" not in response_text:
+                if name_match := re.search(r'Наименование:\s*(.*)', response_text):
+                    result['name'] = name_match.group(1).strip()
+                if price_match := re.search(r'Цена за штуку:\s*([\d.,]+)', response_text):
+                    result['price'] = float(price_match.group(1).replace(',', '.'))
+                    result['found'] = True
+                if stock_match := re.search(r'Количество на складе:\s*(\d+)', response_text):
+                    result['stock_quantity'] = int(stock_match.group(1))
         except Exception as e:
-            print(f"⚠️ Ошибка парсинга ответа второго бота: {e}")
+            print(f"⚠️ Ошибка парсинга: {e}")
 
         return result
 
-    async def process_message_queue(self):
-        while True:
-            try:
-                if self.message_queue and not self.processing_active:
-                    async with self.processing_lock:
-                        if self.message_queue and not self.processing_active:
-                            self.processing_active = True
-                            message_data = self.message_queue.popleft()
-
-                            print(f"🚀 Начата обработка сообщения ID: {message_data['message'].id}")
-
-                            # Создаем новый объект для обработки
-                            processing_data = {
-                                'message': message_data['message'],
-                                'user': message_data['user'],
-                                'articles_data': [],
-                                'responses': [],
-                                'timestamp': datetime.now(),
-                                'api_response': None
-                            }
-
-                            # Получаем ответ от API
-                            # Было:
-                            # api_response = await self.send_to_protalk_api(message_data['message'].message)
-
-                            # Стало:
-                            api_response = await self.extract_articles_with_perplexity(message_data['message'].message)
-                            if not api_response:
-                                print("❌ Не удалось получить ответ от API")
-                                self.processing_active = False
-                                continue
-
-                            processing_data['api_response'] = api_response
-
-                            # Обрабатываем ответ API
-                            await self.process_api_response(processing_data)
-
-                            # Если есть артикулы для обработки - отправляем их во второй канал
-                            if processing_data['articles_data']:
-                                self.current_message_processing = processing_data
-                                for article in processing_data['articles_data']:
-                                    await self.client.send_message(self.output_channel, article['article'])
-                                    print(f"📤 Отправлен артикул во второй канал: {article['article']}")
-                                    self.article_timeouts[article['article']] = datetime.now()
-                                    self.pending_responses.add(article['article'])
-                            else:
-                                print("ℹ️ Нет артикулов для обработки")
-                                self.processing_active = False
-
-                await asyncio.sleep(1)
-            except Exception as e:
-                print(f"⚠️ Ошибка в process_message_queue: {e}")
-                self.processing_active = False
-                self.current_message_processing = None
-                await asyncio.sleep(1)
-
-    async def process_api_response(self, processing_data):
-        try:
-            api_response = processing_data['api_response']
-            if not api_response or 'done' not in api_response:
-                print("ℹ️ Пустой ответ от API или отсутствует поле 'done'")
-                return
-
-            response_text = api_response['done'].strip()
-            if not response_text or response_text in ('...', '…'):
-                print("ℹ️ Ответ от API не содержит полезной информации")
-                return
-
-            lines = [line.strip() for line in response_text.split('\n') if line.strip()]
-            if not lines:
-                print("ℹ️ Нет строк для обработки в ответе API")
-                return
-
-            for line in lines:
-                if ':' not in line:
-                    continue
-
-                try:
-                    article_part, quantity_part = line.split(':', 1)
-                    article = article_part.strip()
-                    quantity = quantity_part.strip().split()[0]
-                    quantity = float(quantity)
-
-                    processing_data['articles_data'].append({
-                        'article': article,
-                        'quantity': quantity,
-                        'processed': False,
-                        'found': None,
-                        'response_received': False
-                    })
-
-                except Exception as e:
-                    print(f"⚠️ Ошибка обработки строки '{line}': {e}")
-                    continue
-
-        except Exception as e:
-            print(f"⚠️ Ошибка в process_api_response: {e}")
-
-    async def handle_output_channel_response(self, response_message):
-        if not self.processing_active or self.current_message_processing is None:
-            return
-
-        try:
-            bot_data = self.parse_second_bot_response(response_message.message)
-
-            for article_data in self.current_message_processing['articles_data']:
-                if (article_data['article'] in response_message.message and
-                        not article_data['processed'] and
-                        article_data['article'] in self.pending_responses):
-
-                    article_data['processed'] = True
-                    article_data['found'] = bot_data['found']
-                    article_data['response_received'] = True
-
-                    if bot_data['found']:
-                        self.current_message_processing['responses'].append({
-                            'article_data': article_data,
-                            'bot_data': bot_data
-                        })
-
-                    self.pending_responses.discard(article_data['article'])
-                    if article_data['article'] in self.article_timeouts:
-                        del self.article_timeouts[article_data['article']]
-
-                    await self.check_complete_response()
-                    return
-
-        except Exception as e:
-            print(f"⚠️ Ошибка обработки ответа второго бота: {e}")
-
     async def check_complete_response(self):
-        if not self.processing_active or self.current_message_processing is None:
+        """Проверка завершения обработки всех артикулов"""
+        if not self.processing_active:
             return
 
-        try:
-            timeout_threshold = timedelta(seconds=60)
-            current_time = datetime.now()
-            all_processed = True
+        timeout = timedelta(seconds=60)
+        now = datetime.now()
 
-            for article in self.current_message_processing['articles_data']:
-                if not article['processed']:
-                    if article['article'] in self.article_timeouts:
-                        if (current_time - self.article_timeouts[article['article']]) > timeout_threshold:
-                            article['processed'] = True
-                            article['found'] = False
-                            article['response_received'] = True
-                            self.pending_responses.discard(article['article'])
-                            del self.article_timeouts[article['article']]
-                        else:
-                            all_processed = False
-                    else:
-                        all_processed = False
+        all_processed = all(
+            article['processed'] or
+            (article['article'] in self.article_timeouts and
+             (now - self.article_timeouts[article['article']]) > timeout)
+            for article in self.current_message_processing['articles_data']
+        )
 
-            if all_processed:
-                await self.finalize_processing()
-        except Exception as e:
-            print(f"⚠️ Ошибка в check_complete_response: {e}")
+        if all_processed:
             await self.finalize_processing()
 
     async def finalize_processing(self):
-        if not self.processing_active or self.current_message_processing is None:
+        """Финальная обработка и отправка результата"""
+        if not self.processing_active:
             return
 
         try:
-            articles_data = self.current_message_processing['articles_data']
+            priced_items = [
+                r for r in self.current_message_processing['responses']
+                if r['article_data']['found']
+            ]
 
-            if not articles_data:
-                print("ℹ️ Нет артикулов для обработки")
-                self.cleanup_processing()
-                return
-
-            has_priced_items = any(article.get('found', False) for article in articles_data)
-            has_unpriced_items = any(not article.get('found', True) for article in articles_data)
-
-            if has_priced_items:
-                await self.send_combined_response()
+            if priced_items:
+                await self.send_to_private_channel()
             else:
-                print("ℹ️ Нет расцененных артикулов - сообщение не отправляется")
+                print("ℹ️ Нет расцененных артикулов")
 
-            self.cleanup_processing()
-        except Exception as e:
-            print(f"⚠️ Ошибка в finalize_processing: {e}")
+        finally:
             self.cleanup_processing()
 
-    async def send_combined_response(self):
+    async def send_to_private_channel(self):
+        """Формирование и отправка результата в приватный канал"""
         try:
             message_data = self.current_message_processing
             original_message = message_data['message']
-            responses = message_data['responses']
-            articles = message_data['articles_data']
 
-            priced_items = []
-            unpriced_articles = []
-
-            for article in articles:
-                if article.get('found', False):
-                    response = next((r for r in responses if r['article_data']['article'] == article['article']), None)
-                    if response:
-                        priced_items.append(response)
-                elif article.get('found', False) is False:
-                    unpriced_articles.append(article['article'])
-
+            # Получаем информацию о канале отправителя
             channel_entity = await self.client.get_entity(original_message.peer_id)
             post_link = f"https://t.me/c/{channel_entity.id}/{original_message.id}"
-            response_text = f"📎 [Ссылка на пост]({post_link})\n\n"
 
+            # Создаем заголовок сообщения
+            response_text = f"📎 [Исходное сообщение]({post_link})\n\n"
+            response_text += "📊 Результат обработки артикулов:\n\n"
+
+            # Рассчитываем суммы
             total_sum = 0
             total_discount_sum = 0
 
-            if priced_items:
-                response_text += "✅ Расценены следующие артикулы:\n\n"
-
-                for item in priced_items:
-                    article_data = item['article_data']
+            for item in message_data['responses']:
+                if item['article_data']['found']:
                     bot_data = item['bot_data']
+                    article_data = item['article_data']
 
                     item_total = bot_data['price'] * article_data['quantity']
                     item_discount = item_total * 0.97
@@ -457,61 +282,46 @@ class ChannelMonitor:
                     total_sum += item_total
                     total_discount_sum += item_discount
 
-                    stock_info = f" ({bot_data['stock_quantity']} на складе)" if bot_data[
-                                                                                     'stock_quantity'] is not None else ""
+                    stock_info = f" ({bot_data['stock_quantity']} шт.)" if bot_data['stock_quantity'] else ""
 
                     response_text += (
                         f"🔹 Артикул: {article_data['article']}\n"
-                        f"🏷️ Наименование: {bot_data['name'] or 'Не указано'}\n"
-                        f"📦 Запрошенное количество: {article_data['quantity']}{stock_info}\n"
-                        f"💰 Цена за единицу: {bot_data['price']:.2f}\n"
-                        f"🧮 Итого по позиции: {item_total:.2f}\n"
-                        f"🎁 Со скидкой 3%: {item_discount:.2f}\n\n"
+                        f"🏷️ Наименование: {bot_data['name'] or 'Без названия'}\n"
+                        f"📦 Количество: {article_data['quantity']}{stock_info}\n"
+                        f"💰 Цена: {bot_data['price']:.2f} ₽/шт\n"
+                        f"🧮 Сумма: {item_total:.2f} ₽\n"
+                        f"🎁 Со скидкой 3%: {item_discount:.2f} ₽\n\n"
                     )
 
-            if unpriced_articles and priced_items:
-                response_text += "\n🚫 Не расценены следующие артикулы:\n"
-                for article in unpriced_articles:
-                    response_text += f"• {article}\n"
-                response_text += "\n"
-
-            if priced_items:
+            # Добавляем итоговую информацию
+            if total_sum > 0:
                 response_text += (
-                    f"💵 Общая сумма: {total_sum:.2f}\n"
-                    f"💳 Общая сумма со скидкой: {total_discount_sum:.2f}\n"
+                    f"💵 Общая сумма: {total_sum:.2f} ₽\n"
+                    f"💳 Со скидкой: {total_discount_sum:.2f} ₽\n"
                 )
 
-            if priced_items:
-                await self.client.send_message(
-                    config.USER_ID,
-                    response_text,
-                    reply_to=original_message,
-                    link_preview=False
-                )
-                print(
-                    f"✉️ Отправлен ответ: {len(priced_items)} расцененных, {len(unpriced_articles)} нерасцененных артикулов")
+            # Отправляем сообщение в приватный канал
+            await self.client.send_message(
+                entity=self.private_channel,
+                message=response_text,
+                link_preview=False
+            )
+
+            print(f"✉️ Результат отправлен в приватный канал {self.private_channel.title}")
 
         except Exception as e:
-            print(f"⚠️ Ошибка формирования ответа: {e}")
+            print(f"⚠️ Ошибка при отправке в приватный канал: {e}")
 
     def cleanup_processing(self):
+        """Очистка данных после обработки"""
         self.processing_active = False
         self.current_message_processing = None
         self.article_timeouts.clear()
         self.pending_responses.clear()
 
-    async def check_timeouts(self):
-        while True:
-            try:
-                if self.processing_active and self.current_message_processing:
-                    await self.check_complete_response()
-                await asyncio.sleep(5)
-            except Exception as e:
-                print(f"⚠️ Ошибка проверки таймаутов: {e}")
-                await asyncio.sleep(10)
-
     async def monitor_output_channel(self):
-        print("👂 Начало мониторинга второго канала...")
+        """Мониторинг ответов от второго бота"""
+        print("👂 Начало мониторинга выходного канала...")
         last_id = 0
 
         while True:
@@ -519,12 +329,8 @@ class ChannelMonitor:
                 history = await self.client(GetHistoryRequest(
                     peer=self.output_channel,
                     limit=5,
-                    offset_date=None,
                     offset_id=0,
-                    max_id=0,
-                    min_id=last_id,
-                    add_offset=0,
-                    hash=0
+                    min_id=last_id
                 ))
 
                 if history.messages:
@@ -535,10 +341,11 @@ class ChannelMonitor:
 
                 await asyncio.sleep(5)
             except Exception as e:
-                print(f"⚠️ Ошибка мониторинга второго канала: {e}")
+                print(f"⚠️ Ошибка мониторинга канала: {e}")
                 await asyncio.sleep(10)
 
     async def process_messages(self, user, messages):
+        """Обработка новых сообщений из канала"""
         new_messages = [msg for msg in messages if msg.id > self.last_checked_id]
 
         if not new_messages:
@@ -551,7 +358,7 @@ class ChannelMonitor:
             if not message.message:
                 continue
 
-            print(f"📥 Добавлено в очередь сообщение ID: {message.id}")
+            print(f"\n📥 Новое сообщение в очереди (ID: {message.id})")
             self.message_queue.append({
                 'message': message,
                 'user': user
@@ -559,51 +366,49 @@ class ChannelMonitor:
 
         self.last_checked_id = max(msg.id for msg in messages_to_process)
 
+    async def check_timeouts(self):
+        """Проверка таймаутов обработки артикулов"""
+        while True:
+            try:
+                if self.processing_active and self.current_message_processing:
+                    await self.check_complete_response()
+                await asyncio.sleep(5)
+            except Exception as e:
+                print(f"⚠️ Ошибка проверки таймаутов: {e}")
+                await asyncio.sleep(10)
+
 
 async def main():
     monitor = ChannelMonitor()
     await monitor.initialize()
 
     try:
-        if isinstance(config.CHANNEL_ID, str):
-            input_channel = await monitor.client.get_entity(config.CHANNEL_ID)
-        else:
-            input_channel = await monitor.client.get_entity(int(config.CHANNEL_ID))
-        print(f"🔍 Мониторим канал: {input_channel.title}")
+        # Получаем входной канал и пользователя
+        input_channel = await monitor.client.get_entity(config.CHANNEL_ID)
+        user = await monitor.client.get_entity(config.USER_ID)
 
-        if isinstance(config.USER_ID, str):
-            if config.USER_ID.startswith('@'):
-                user = await monitor.client.get_entity(config.USER_ID)
-            else:
-                try:
-                    user = await monitor.client.get_entity(int(config.USER_ID))
-                except ValueError:
-                    user = await monitor.client.get_entity(config.USER_ID)
-        else:
-            user = await monitor.client.get_entity(int(config.USER_ID))
-        print(f"👤 Получен пользователь: {user.first_name}")
+        print(f"\n🔍 Мониторинг канала: {input_channel.title}")
+        print(f"👤 Пользователь: {user.first_name if user.first_name else user.username}\n")
 
-        asyncio.create_task(monitor.monitor_output_channel())
-        asyncio.create_task(monitor.check_timeouts())
-        asyncio.create_task(monitor.process_message_queue())
+        # Запускаем фоновые задачи
+        tasks = [
+            asyncio.create_task(monitor.monitor_output_channel()),
+            asyncio.create_task(monitor.check_timeouts()),
+            asyncio.create_task(monitor.process_message_queue())
+        ]
 
+        # Основной цикл обработки сообщений
         while True:
             try:
                 history = await monitor.client(GetHistoryRequest(
                     peer=input_channel,
                     limit=100,
-                    offset_date=None,
                     offset_id=0,
-                    max_id=0,
-                    min_id=monitor.last_checked_id,
-                    add_offset=0,
-                    hash=0
+                    min_id=monitor.last_checked_id
                 ))
 
                 if history.messages:
                     await monitor.process_messages(user, history.messages)
-                else:
-                    print("ℹ️ Новых сообщений нет")
 
                 await asyncio.sleep(60)
             except Exception as e:
@@ -611,13 +416,15 @@ async def main():
                 await asyncio.sleep(10)
 
     except Exception as e:
-        print(f"⚠️ Критическая ошибка: {e}")
+        print(f"🚨 Критическая ошибка: {e}")
     finally:
         await monitor.client.disconnect()
+        print("🔴 Бот остановлен")
 
 
 if __name__ == '__main__':
+    print("🟢 Запуск бота для обработки артикулов")
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        print("🛑 Бот остановлен")
+        print("\n🔴 Бот остановлен пользователем")
