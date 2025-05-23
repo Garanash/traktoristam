@@ -239,7 +239,7 @@ class ChannelMonitor:
         while True:
             try:
                 now = datetime.now()
-                timeout = timedelta(seconds=30)
+                timeout = timedelta(seconds=10)
 
                 for article, timestamp in list(self.article_timeouts.items()):
                     if (now - timestamp) > timeout:
@@ -325,6 +325,7 @@ class ChannelMonitor:
             if total_sum > 0:
                 response_text += (
                     f"\n💵 Общая сумма: {total_sum:.2f} ₽\n"
+                    f"💳 Сумма со скидкой 3%: {total_discount_sum:.2f} ₽\n"
                 )
 
             await self.client.send_message(
