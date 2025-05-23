@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 from collections import deque
 from telethon import TelegramClient, events
 from telethon.tl.functions.messages import GetHistoryRequest
+from bs4 import BeautifulSoup
 import config
 
 
@@ -22,6 +23,7 @@ class ChannelMonitor:
         self.api_request_lock = asyncio.Lock()
         self.processing_lock = asyncio.Lock()
         self.processing_active = False
+        self.autopiter_session = aiohttp.ClientSession()
 
     async def initialize(self):
         """Инициализация клиента Telegram и каналов"""
@@ -47,6 +49,34 @@ class ChannelMonitor:
         except Exception as e:
             print(f"⚠️ Ошибка инициализации каналов: {e}")
             raise
+
+    async def fetch_autopiter_price(self, article):
+        """Парсинг цены с Autopiter"""
+        url = f"https://autopiter.ru/goods/{article}"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+        }
+
+        try:
+            async with self.autopiter_session.get(url, headers=headers, timeout=10) as response:
+                if response.status == 200:
+                    html = await response.text()
+                    soup = BeautifulSoup(html, 'html.parser')
+
+                    # Ищем товар с точным совпадением артикула
+                    for item in soup.select('ul.goods-list li.goods-list__item'):
+                        part_number = item.select_one('div.goods-list__info div.goods-list__article p')
+                        if part_number and article.lower() in part_number.get_text().lower():
+                            price_element = item.select_one('div.goods-list__price span.price__value')
+                            if price_element:
+                                price_text = price_element.get_text().strip()
+                                price = float(re.sub(r'[^\d.]', '', price_text.replace(',', '.')))
+                                return price
+                    return None
+                return None
+        except Exception as e:
+            print(f"⚠️ Ошибка парсинга Autopiter: {e}")
+            return None
 
     async def extract_articles_with_perplexity(self, message_text):
         """Запрос к Perplexity API для извлечения артикулов"""
@@ -118,7 +148,8 @@ class ChannelMonitor:
                                 'articles_data': [],
                                 'responses': [],
                                 'timestamp': datetime.now(),
-                                'pending_articles': set()
+                                'pending_articles': set(),
+                                'total_articles': 0
                             }
 
                             api_response = await self.extract_articles_with_perplexity(
@@ -128,6 +159,9 @@ class ChannelMonitor:
                             if api_response:
                                 await self.process_api_response(processing_data, api_response)
 
+                                # Запоминаем общее количество артикулов
+                                processing_data['total_articles'] = len(processing_data['articles_data'])
+
                                 for article in processing_data['articles_data']:
                                     await self.client.send_message(
                                         self.output_channel,
@@ -136,6 +170,11 @@ class ChannelMonitor:
                                     self.article_timeouts[article['article']] = datetime.now()
                                     processing_data['pending_articles'].add(article['article'])
                                     self.pending_responses[article['article']] = processing_data
+
+                                    # Получаем цену с Autopiter
+                                    autopiter_price = await self.fetch_autopiter_price(article['article'])
+                                    if autopiter_price:
+                                        article['autopiter_price'] = autopiter_price
 
                                 self.current_message_processing = processing_data
                             else:
@@ -160,7 +199,8 @@ class ChannelMonitor:
                     'quantity': float(quantity),
                     'processed': False,
                     'found': None,
-                    'response_data': None
+                    'response_data': None,
+                    'autopiter_price': None
                 })
                 print(f"🔍 Найден артикул: {article} ({quantity} шт.)")
             except Exception as e:
@@ -199,15 +239,18 @@ class ChannelMonitor:
                                 found_articles.add(article)
                                 processing_data['pending_articles'].discard(article)
 
+                                # Проверяем, все ли артикулы обработаны
+                                if (len(processing_data['responses']) +
+                                    sum(1 for a in processing_data['articles_data']
+                                        if a['processed'] and not a['found'])) == processing_data['total_articles']:
+                                    await self.finalize_processing(processing_data)
+                                    return
+
                 for article in found_articles:
                     if article in self.pending_responses:
                         del self.pending_responses[article]
                     if article in self.article_timeouts:
                         del self.article_timeouts[article]
-
-                    processing_data = self.pending_responses.get(article)
-                    if processing_data and not processing_data['pending_articles']:
-                        await self.finalize_processing(processing_data)
         except Exception as e:
             print(f"⚠️ Ошибка в handle_output_channel_response: {e}")
 
@@ -239,7 +282,7 @@ class ChannelMonitor:
         while True:
             try:
                 now = datetime.now()
-                timeout = timedelta(seconds=10)
+                timeout = timedelta(seconds=60)
 
                 for article, timestamp in list(self.article_timeouts.items()):
                     if (now - timestamp) > timeout:
@@ -260,7 +303,10 @@ class ChannelMonitor:
                             if article in self.article_timeouts:
                                 del self.article_timeouts[article]
 
-                            if not processing_data['pending_articles']:
+                            # Проверяем, все ли артикулы обработаны
+                            if (len(processing_data['responses']) +
+                                sum(1 for a in processing_data['articles_data']
+                                    if a['processed'] and not a['found'])) == processing_data['total_articles']:
                                 await self.finalize_processing(processing_data)
                 await asyncio.sleep(5)
             except Exception as e:
@@ -278,7 +324,7 @@ class ChannelMonitor:
                 if r['article_data']['found']
             ]
 
-            if priced_items:
+            if priced_items or any(a.get('autopiter_price') for a in processing_data['articles_data']):
                 await self.send_to_private_channel(processing_data)
             else:
                 print("ℹ️ Нет расцененных артикулов")
@@ -302,30 +348,33 @@ class ChannelMonitor:
             total_sum = 0
             total_discount_sum = 0
 
-            for item in processing_data['responses']:
-                if item['article_data']['found']:
-                    bot_data = item['bot_data']
-                    article_data = item['article_data']
+            for article_data in processing_data['articles_data']:
+                if article_data['found'] or article_data.get('autopiter_price'):
+                    response_text += f"\n🔹 Артикул: {article_data['article']}\n"
+                    response_text += f"📦 Запрошенное количество: {int(article_data['quantity'])}\n"
 
-                    item_total = bot_data['price'] * article_data['quantity']
-                    item_discount = item_total * 0.97
+                    if article_data['found']:
+                        bot_data = article_data['response_data']
+                        item_total = bot_data['price'] * article_data['quantity']
+                        item_discount = item_total * 0.97
 
-                    total_sum += item_total
-                    total_discount_sum += item_discount
+                        total_sum += item_total
+                        total_discount_sum += item_discount
 
-                    stock_info = f" ({bot_data['stock_quantity']} шт на складе)" if bot_data['stock_quantity'] else ""
+                        stock_info = f" ({bot_data['stock_quantity']} шт на складе)" if bot_data[
+                            'stock_quantity'] else ""
 
-                    response_text += (
-                        f"\n🔹 Артикул: {article_data['article']}\n"
-                        f"🏷️ Наименование: {bot_data['name'] or 'Без названия'}\n"
-                        f"📦 Запрошенное количество: {int(article_data['quantity'])} {stock_info}\n"
-                        f"💰 Цена за штуку: {bot_data['price']:.2f} ₽/шт\n"
-                    )
+                        response_text += (
+                            f"🏷️ Наименование: {bot_data['name'] or 'Без названия'}{stock_info}\n"
+                            f"💰 Цена за штуку: {bot_data['price']:.2f} ₽/шт\n"
+                        )
+
+                    if article_data.get('autopiter_price'):
+                        response_text += f"🛒 Цена на Autopiter: {article_data['autopiter_price']:.2f} ₽/шт\n"
 
             if total_sum > 0:
                 response_text += (
                     f"\n💵 Общая сумма: {total_sum:.2f} ₽\n"
-                    f"💳 Сумма со скидкой 3%: {total_discount_sum:.2f} ₽\n"
                 )
 
             await self.client.send_message(
@@ -381,6 +430,11 @@ class ChannelMonitor:
 
         self.last_checked_id = max(msg.id for msg in messages_to_process)
 
+    async def close(self):
+        """Корректное закрытие сессий"""
+        await self.autopiter_session.close()
+        await self.client.disconnect()
+
 
 async def main():
     monitor = ChannelMonitor()
@@ -423,7 +477,7 @@ async def main():
     except Exception as e:
         print(f"🚨 Критическая ошибка: {e}")
     finally:
-        await monitor.client.disconnect()
+        await monitor.close()
         print("🔴 Бот остановлен")
 
 
