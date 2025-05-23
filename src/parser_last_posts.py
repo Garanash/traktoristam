@@ -51,31 +51,81 @@ class ChannelMonitor:
             raise
 
     async def fetch_autopiter_price(self, article):
-        """Парсинг цены с Autopiter"""
+        """Парсинг цены с Autopiter с улучшенной проверкой артикула"""
         url = f"https://autopiter.ru/goods/{article}"
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
         }
 
         try:
-            async with self.autopiter_session.get(url, headers=headers, timeout=10) as response:
-                if response.status == 200:
-                    html = await response.text()
-                    soup = BeautifulSoup(html, 'html.parser')
-
-                    # Ищем товар с точным совпадением артикула
-                    for item in soup.select('ul.goods-list li.goods-list__item'):
-                        part_number = item.select_one('div.goods-list__info div.goods-list__article p')
-                        if part_number and article.lower() in part_number.get_text().lower():
-                            price_element = item.select_one('div.goods-list__price span.price__value')
-                            if price_element:
-                                price_text = price_element.get_text().strip()
-                                price = float(re.sub(r'[^\d.]', '', price_text.replace(',', '.')))
-                                return price
+            async with self.autopiter_session.get(url, headers=headers, timeout=15) as response:
+                if response.status != 200:
+                    print(f"⚠️ Ошибка HTTP {response.status} при запросе к Autopiter")
                     return None
+
+                html = await response.text()
+                soup = BeautifulSoup(html, 'html.parser')
+
+                # Генерируем все возможные варианты артикула
+                base_article = article.strip()
+                article_variants = {
+                    'original': base_article,
+                    'lower': base_article.lower(),
+                    'upper': base_article.upper(),
+                    'no_special_chars': re.sub(r'[-_/]', '', base_article),
+                    'no_special_lower': re.sub(r'[-_/]', '', base_article).lower(),
+                    'no_special_upper': re.sub(r'[-_/]', '', base_article).upper(),
+                    'letters_only': re.sub(r'[^A-Za-z]', '', base_article),
+                    'digits_only': re.sub(r'[^0-9]', '', base_article),
+                    'combined': re.sub(r'[-_/]', '', base_article).replace(' ', '')
+                }
+
+                # Ищем все span элементы с CSS-селектором, содержащим MobileSearchingResultItem__article
+                article_spans = soup.select('span[class^="MobileSearchingResultItem"]')
+                print(article_spans)
+                for article_span in article_spans:
+                    product_article = article_span.get_text(strip=True)
+
+                    # Проверяем все варианты артикула
+                    for var_name, var_value in article_variants.items():
+                        normalized_product = re.sub(r'\s+', '', product_article).lower()
+                        normalized_variant = re.sub(r'\s+', '', var_value).lower()
+
+                        if normalized_variant in normalized_product:
+                            # Поднимаемся на 5 уровней вверх
+                            parent = article_span
+                            for _ in range(5):
+                                parent = parent.parent
+                                if parent is None:
+                                    break
+
+                            if parent is not None:
+                                # Ищем span с нужным классом статуса (где уже есть цена)
+                                status_span = parent.select_one('span[class^="Status__root"]')
+                                print(status_span)
+                                if status_span:
+                                    # Извлекаем весь текст из спана статуса
+                                    status_text = status_span.get_text(strip=True)
+
+                                    # Ищем число в тексте (может быть "От 3256 ₽" или просто "3256 ₽")
+                                    price_match = re.search(r'\d+[\s,.]?\d*', status_text)
+                                    if price_match:
+                                        try:
+                                            # Очищаем цену от пробелов и заменяем запятые на точки
+                                            price_text = price_match.group(0).replace(' ', '').replace(',', '.')
+                                            price = float(price_text)
+                                            print(
+                                                f"✅ Совпадение артикула '{base_article}' (вариант {var_name}) | Цена: {price}")
+                                            return price
+                                        except ValueError as e:
+                                            print(f"⚠️ Ошибка преобразования цены '{price_match.group(0)}': {str(e)}")
+                                            continue
+
+                print(f"⚠️ Артикул '{base_article}' не найден среди {len(article_variants)} вариантов")
                 return None
+
         except Exception as e:
-            print(f"⚠️ Ошибка парсинга Autopiter: {e}")
+            print(f"⚠️ Критическая ошибка при парсинге Autopiter: {str(e)}")
             return None
 
     async def extract_articles_with_perplexity(self, message_text):
@@ -159,7 +209,6 @@ class ChannelMonitor:
                             if api_response:
                                 await self.process_api_response(processing_data, api_response)
 
-                                # Запоминаем общее количество артикулов
                                 processing_data['total_articles'] = len(processing_data['articles_data'])
 
                                 for article in processing_data['articles_data']:
@@ -171,10 +220,10 @@ class ChannelMonitor:
                                     processing_data['pending_articles'].add(article['article'])
                                     self.pending_responses[article['article']] = processing_data
 
-                                    # Получаем цену с Autopiter
                                     autopiter_price = await self.fetch_autopiter_price(article['article'])
-                                    if autopiter_price:
+                                    if autopiter_price is not None:
                                         article['autopiter_price'] = autopiter_price
+                                        print(f"🛒 Цена с Autopiter для {article['article']}: {autopiter_price}")
 
                                 self.current_message_processing = processing_data
                             else:
@@ -239,7 +288,6 @@ class ChannelMonitor:
                                 found_articles.add(article)
                                 processing_data['pending_articles'].discard(article)
 
-                                # Проверяем, все ли артикулы обработаны
                                 if (len(processing_data['responses']) +
                                     sum(1 for a in processing_data['articles_data']
                                         if a['processed'] and not a['found'])) == processing_data['total_articles']:
@@ -303,7 +351,6 @@ class ChannelMonitor:
                             if article in self.article_timeouts:
                                 del self.article_timeouts[article]
 
-                            # Проверяем, все ли артикулы обработаны
                             if (len(processing_data['responses']) +
                                 sum(1 for a in processing_data['articles_data']
                                     if a['processed'] and not a['found'])) == processing_data['total_articles']:
@@ -324,7 +371,7 @@ class ChannelMonitor:
                 if r['article_data']['found']
             ]
 
-            if priced_items or any(a.get('autopiter_price') for a in processing_data['articles_data']):
+            if priced_items or any(a.get('autopiter_price') is not None for a in processing_data['articles_data']):
                 await self.send_to_private_channel(processing_data)
             else:
                 print("ℹ️ Нет расцененных артикулов")
@@ -346,20 +393,16 @@ class ChannelMonitor:
             response_text += "📊 Результат обработки артикулов:\n"
 
             total_sum = 0
-            total_discount_sum = 0
 
             for article_data in processing_data['articles_data']:
-                if article_data['found'] or article_data.get('autopiter_price'):
+                if article_data['found'] or article_data.get('autopiter_price') is not None:
                     response_text += f"\n🔹 Артикул: {article_data['article']}\n"
                     response_text += f"📦 Запрошенное количество: {int(article_data['quantity'])}\n"
 
                     if article_data['found']:
                         bot_data = article_data['response_data']
                         item_total = bot_data['price'] * article_data['quantity']
-                        item_discount = item_total * 0.97
-
                         total_sum += item_total
-                        total_discount_sum += item_discount
 
                         stock_info = f" ({bot_data['stock_quantity']} шт на складе)" if bot_data[
                             'stock_quantity'] else ""
@@ -369,13 +412,11 @@ class ChannelMonitor:
                             f"💰 Цена за штуку: {bot_data['price']:.2f} ₽/шт\n"
                         )
 
-                    if article_data.get('autopiter_price'):
+                    if article_data.get('autopiter_price') is not None:
                         response_text += f"🛒 Цена на Autopiter: {article_data['autopiter_price']:.2f} ₽/шт\n"
 
             if total_sum > 0:
-                response_text += (
-                    f"\n💵 Общая сумма: {total_sum:.2f} ₽\n"
-                )
+                response_text += f"\n💵 Общая сумма: {total_sum:.2f} ₽\n"
 
             await self.client.send_message(
                 entity=self.private_channel,
