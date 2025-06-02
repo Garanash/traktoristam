@@ -8,7 +8,7 @@ from urllib3.exceptions import InsecureRequestWarning
 urllib3.disable_warnings(InsecureRequestWarning)
 
 # Конфигурация
-TOKEN = "8164754969:AAGOgO3oEccKdxbreCv9TpRiSw3Nby5qv04"
+TOKEN = "7629416118:AAEQZ3MJ651dkEUT8bA9j4XbdV05FzwbwD4"
 BASE_FILE_PATH = "files/base.xlsx"
 PROXY_URL = None
 
